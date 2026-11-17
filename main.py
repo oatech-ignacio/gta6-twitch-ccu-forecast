@@ -7,6 +7,9 @@ Analog ("comparable launches") forecaster:
   2. Each comparable gets a weight = prior (unlock pattern, platforms, tier, read from its notes)
      x a Gaussian kernel on features known at the checkpoint: hour 1's size, hour 1 relative to the
      previous 24 hours' peak ("is the launch already live?") and the trend into hour 1.
+     Each neighbour's log-ratio is first moved along a (half-strength) local-linear slope in
+     hour-1 size to the case's own size, clipped to the neighbours' size range: bigger launches
+     grow less over the day, and the case may be the biggest of all.
   3. Per hour: weighted median of the log-ratios (smoothed over neighbouring hours) is the median
      forecast; the spread comes from the comparables' weighted quantiles around it (25/75 for the
      inner pair, a 25/75 + 10/90 blend for the 5/95 tails), separately below and above the median,
@@ -37,11 +40,12 @@ PARAMS = {
     "bw_size": 1.6,      # kernel bandwidth on ln(hour-1 viewers)
     "bw_live": 0.8,      # kernel bandwidth on ln(hour 1 / previous-24h peak)
     "bw_trend": 0.6,     # kernel bandwidth on ln(hour 1 / mean of the 3 hours before)
+    "slope": 0.5,        # share of the local-linear size slope applied (0 = plain kernel median)
     "smooth": 1,         # half-width (hours) of the smoothing of the median curve
     "spread_mult": 0.9,  # scale of the inner (25/75) spread
-    "tail_mult": 0.95,   # scale of the tail (5/95) spread
+    "tail_mult": 1.1,    # scale of the tail (5/95) spread
     "tail_w": 0.5,       # share of the 10/90 quantiles (vs the 25/75 ones) in the tail spread
-    "floor": 0.12,       # random-walk floor of the spread, per sqrt(hour)
+    "floor": 0.14,       # random-walk floor of the spread, per sqrt(hour)
     "mom_w": 0.7,        # weight of the end-of-hour-1 momentum at hour 2
     "mom_decay": 3.0,    # e-folding (hours) of that momentum
     "mom_clip": 0.35,    # largest momentum adjustment, in log units
@@ -186,11 +190,23 @@ def model(case: dict, P: dict = PARAMS) -> dict:
     # tail pair (10/90) are both turned into Gaussian-equivalent sigmas, separately below and above.
     med, il, ih, tl, th = {}, {}, {}, {}, {}
     for h in range(2, 25):
-        pairs = [(c["r"][h], c["w"]) for c in comps if h in c["r"] and c["w"] > 0]
-        if len(pairs) < 3:
+        use = [c for c in comps if h in c["r"] and c["w"] > 0]
+        if len(use) < 3:
             fb = 0.15 * math.sqrt(h - 1)
             med[h], il[h], ih[h], tl[h], th[h] = 0.0, fb, fb, fb, fb
             continue
+        # Local-linear correction for hour-1 size: bigger launches grow less over the day, and a kernel
+        # average at the edge of the size range is biased towards the smaller neighbours. Each neighbour's
+        # log-ratio is moved along the weighted least-squares slope to the case's size (kept inside the
+        # neighbours' own size range, so nothing is extrapolated beyond the data).
+        sw = sum(c["w"] for c in use)
+        xm = sum(c["w"] * c["f"][0] for c in use) / sw
+        ym = sum(c["w"] * c["r"][h] for c in use) / sw
+        sxx = sum(c["w"] * (c["f"][0] - xm) ** 2 for c in use) / sw
+        sxy = sum(c["w"] * (c["f"][0] - xm) * (c["r"][h] - ym) for c in use) / sw
+        slope = P["slope"] * sxy / (sxx + 0.25)  # ridge: a narrow size range gives no slope
+        x0 = max(min(c["f"][0] for c in use), min(max(c["f"][0] for c in use), f[0]))
+        pairs = [(c["r"][h] + slope * (x0 - c["f"][0]), c["w"]) for c in use]
         m = wquantile(pairs, 0.5)
         med[h] = m
         il[h] = max(0.0, m - wquantile(pairs, 0.25)) / 0.674
